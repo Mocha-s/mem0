@@ -1,11 +1,12 @@
-from typing import Any, Dict, Optional
-
+import os
+import json
+from typing import Dict, Any, Optional, List
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 from app.database import get_db
 from app.models import Config as ConfigModel
 from app.utils.memory import reset_memory_client
-from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
 
 router = APIRouter(prefix="/api/v1/config", tags=["config"])
 
@@ -15,6 +16,8 @@ class LLMConfig(BaseModel):
     max_tokens: int = Field(..., description="Maximum tokens to generate")
     api_key: Optional[str] = Field(None, description="API key or 'env:API_KEY' to use environment variable")
     ollama_base_url: Optional[str] = Field(None, description="Base URL for Ollama server (e.g., http://host.docker.internal:11434)")
+    base_url: Optional[str] = Field(None, description="Base URL for OpenAI-compatible API servers (e.g., https://api.example.com/v1)")
+    openai_base_url: Optional[str] = Field(None, description="OpenAI base URL for third-party providers (e.g., https://api.example.com/v1)")
 
 class LLMProvider(BaseModel):
     provider: str = Field(..., description="LLM provider name")
@@ -24,6 +27,8 @@ class EmbedderConfig(BaseModel):
     model: str = Field(..., description="Embedder model name")
     api_key: Optional[str] = Field(None, description="API key or 'env:API_KEY' to use environment variable")
     ollama_base_url: Optional[str] = Field(None, description="Base URL for Ollama server (e.g., http://host.docker.internal:11434)")
+    base_url: Optional[str] = Field(None, description="Base URL for OpenAI-compatible API servers (e.g., https://api.example.com/v1)")
+    openai_base_url: Optional[str] = Field(None, description="OpenAI base URL for third-party providers (e.g., https://api.example.com/v1)")
 
 class EmbedderProvider(BaseModel):
     provider: str = Field(..., description="Embedder provider name")
@@ -31,6 +36,8 @@ class EmbedderProvider(BaseModel):
 
 class OpenMemoryConfig(BaseModel):
     custom_instructions: Optional[str] = Field(None, description="Custom instructions for memory management and fact extraction")
+    openapi_url: Optional[str] = Field(None, description="OpenAPI service URL for external API integration")
+    custom_categories: Optional[List[Dict[str, str]]] = Field(None, description="Custom categories for memory classification in format [{'category_name': 'description'}, ...]")
 
 class Mem0Config(BaseModel):
     llm: Optional[LLMProvider] = None
@@ -44,7 +51,9 @@ def get_default_configuration():
     """Get the default configuration with sensible defaults for LLM and embedder."""
     return {
         "openmemory": {
-            "custom_instructions": None
+            "custom_instructions": None,
+            "openapi_url": None,
+            "custom_categories": None
         },
         "mem0": {
             "llm": {

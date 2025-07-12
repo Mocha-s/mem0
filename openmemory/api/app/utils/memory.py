@@ -31,6 +31,8 @@ import hashlib
 import json
 import os
 import socket
+import platform
+from typing import List, Dict
 
 from app.database import SessionLocal
 from app.models import Config as ConfigModel
@@ -137,11 +139,17 @@ def get_default_memory_config():
     """Get default memory client configuration with sensible defaults."""
     return {
         "vector_store": {
-            "provider": "qdrant",
+            "provider": "pgvector",
             "config": {
-                "collection_name": "openmemory",
-                "host": "mem0_store",
-                "port": 6333,
+                "collection_name": "mem0migrations",
+                "host": os.environ.get("VECTOR_STORE_HOST", "postgres"),
+                "port": int(os.environ.get("VECTOR_STORE_PORT", "5432")),
+                "user": os.environ.get("VECTOR_STORE_USER", "mem0user"),
+                "password": os.environ.get("VECTOR_STORE_PASSWORD", "mem0pass"),
+                "dbname": os.environ.get("VECTOR_STORE_DATABASE", "mem0"),
+                "embedding_model_dims": 1536,
+                "diskann": True,
+                "hnsw": False
             }
         },
         "llm": {
@@ -150,14 +158,20 @@ def get_default_memory_config():
                 "model": "gpt-4o-mini",
                 "temperature": 0.1,
                 "max_tokens": 2000,
-                "api_key": "env:OPENAI_API_KEY"
+                "api_key": "env:CUSTOM_OPENAI_API_KEY",
+                "openai_base_url": "env:CUSTOM_OPENAI_API_URL",
+                "timeout": 30.0,
+                "max_retries": 2
             }
         },
         "embedder": {
             "provider": "openai",
             "config": {
                 "model": "text-embedding-3-small",
-                "api_key": "env:OPENAI_API_KEY"
+                "api_key": "env:CUSTOM_OPENAI_API_KEY",
+                "openai_base_url": "env:CUSTOM_OPENAI_API_URL",
+                "timeout": 30.0,
+                "max_retries": 2
             }
         },
         "version": "v1.1"
@@ -168,6 +182,7 @@ def _parse_environment_variables(config_dict):
     """
     Parse environment variables in config values.
     Converts 'env:VARIABLE_NAME' to actual environment variable values.
+    For optional fields like base_url, removes the field if env var doesn't exist.
     """
     if isinstance(config_dict, dict):
         parsed_config = {}
@@ -179,8 +194,15 @@ def _parse_environment_variables(config_dict):
                     parsed_config[key] = env_value
                     print(f"Loaded {env_var} from environment for {key}")
                 else:
-                    print(f"Warning: Environment variable {env_var} not found, keeping original value")
-                    parsed_config[key] = value
+                    # For optional fields like openai_base_url, skip them if env var doesn't exist
+                    # For required fields like api_key, keep the original value
+                    if key in ["base_url", "openai_base_url", "ollama_base_url"]:
+                        print(f"Optional environment variable {env_var} not found, skipping {key}")
+                        # Don't add this key to parsed_config
+                        continue
+                    else:
+                        print(f"Warning: Environment variable {env_var} not found, keeping original value")
+                        parsed_config[key] = value
             elif isinstance(value, dict):
                 parsed_config[key] = _parse_environment_variables(value)
             else:
@@ -189,12 +211,13 @@ def _parse_environment_variables(config_dict):
     return config_dict
 
 
-def get_memory_client(custom_instructions: str = None):
+def get_memory_client(custom_instructions: str = None, custom_categories: List[Dict[str, str]] = None):
     """
     Get or initialize the Mem0 client.
 
     Args:
         custom_instructions: Optional instructions for the memory project.
+        custom_categories: Optional custom categories for memory classification.
 
     Returns:
         Initialized Mem0 client instance or None if initialization fails.
@@ -208,8 +231,9 @@ def get_memory_client(custom_instructions: str = None):
         # Start with default configuration
         config = get_default_memory_config()
         
-        # Variable to track custom instructions
+        # Variable to track custom instructions and categories
         db_custom_instructions = None
+        db_custom_categories = None
         
         # Load configuration from database
         try:
@@ -219,9 +243,12 @@ def get_memory_client(custom_instructions: str = None):
             if db_config:
                 json_config = db_config.value
                 
-                # Extract custom instructions from openmemory settings
-                if "openmemory" in json_config and "custom_instructions" in json_config["openmemory"]:
-                    db_custom_instructions = json_config["openmemory"]["custom_instructions"]
+                # Extract custom instructions and categories from openmemory settings
+                if "openmemory" in json_config:
+                    if "custom_instructions" in json_config["openmemory"]:
+                        db_custom_instructions = json_config["openmemory"]["custom_instructions"]
+                    if "custom_categories" in json_config["openmemory"]:
+                        db_custom_categories = json_config["openmemory"]["custom_categories"]
                 
                 # Override defaults with configurations from the database
                 if "mem0" in json_config:
@@ -256,6 +283,14 @@ def get_memory_client(custom_instructions: str = None):
         instructions_to_use = custom_instructions or db_custom_instructions
         if instructions_to_use:
             config["custom_fact_extraction_prompt"] = instructions_to_use
+
+        # Use custom_categories parameter first, then fall back to database value
+        categories_to_use = custom_categories or db_custom_categories
+        if categories_to_use:
+            config["custom_categories"] = categories_to_use
+
+        # Add dedupe configuration to prevent duplicate memories
+        config["dedupe"] = True
 
         # ALWAYS parse environment variables in the final config
         # This ensures that even default config values like "env:OPENAI_API_KEY" get parsed

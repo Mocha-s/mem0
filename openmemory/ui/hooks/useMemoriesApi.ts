@@ -19,7 +19,7 @@ export interface SimpleMemory {
 interface ApiMemoryItem {
   id: string;
   content: string;
-  created_at: string;
+  created_at: string | number; // 可以是字符串或时间戳
   state: string;
   app_id: string;
   categories: string[];
@@ -139,7 +139,7 @@ export const useMemoriesApi = (): UseMemoriesApiReturn => {
       const adaptedMemories: Memory[] = response.data.items.map((item: ApiMemoryItem) => ({
         id: item.id,
         memory: item.content,
-        created_at: new Date(item.created_at).getTime(),
+        created_at: typeof item.created_at === 'string' ? new Date(item.created_at).getTime() : item.created_at * 1000,
         state: item.state as "active" | "paused" | "archived" | "deleted",
         metadata: item.metadata_,
         categories: item.categories as Category[],

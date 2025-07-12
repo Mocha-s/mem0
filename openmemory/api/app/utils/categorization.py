@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import List
 
 from app.utils.prompts import MEMORY_CATEGORIZATION_PROMPT
@@ -8,7 +9,16 @@ from pydantic import BaseModel
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 load_dotenv()
-openai_client = OpenAI()
+
+def get_openai_client():
+    """获取OpenAI客户端，支持自定义API密钥和URL"""
+    api_key = os.getenv("OPENAI_API_KEY", "sk-test-key-for-development")
+    base_url = os.getenv("OPENAI_BASE_URL")
+    
+    if base_url:
+        return OpenAI(api_key=api_key, base_url=base_url)
+    else:
+        return OpenAI(api_key=api_key)
 
 
 class MemoryCategories(BaseModel):
@@ -18,6 +28,7 @@ class MemoryCategories(BaseModel):
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=4, max=15))
 def get_categories_for_memory(memory: str) -> List[str]:
     try:
+        openai_client = get_openai_client()
         messages = [
             {"role": "system", "content": MEMORY_CATEGORIZATION_PROMPT},
             {"role": "user", "content": memory}

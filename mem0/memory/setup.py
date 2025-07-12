@@ -45,12 +45,22 @@ def get_or_create_user_id(vector_store):
         pass
 
     # If we get here, we need to insert the user_id
+    # Add additional check to prevent duplicate insertions
     try:
+        # First check if the ID already exists to prevent duplicate inserts
+        try:
+            existing_check = vector_store.get(vector_id=user_id)
+            if existing_check:
+                return user_id
+        except Exception:
+            pass
+        
         dims = getattr(vector_store, "embedding_model_dims", 1536)
         vector_store.insert(
             vectors=[[0.1] * dims], payloads=[{"user_id": user_id, "type": "user_identity"}], ids=[user_id]
         )
     except Exception:
+        # Silently ignore insertion errors to prevent loops
         pass
 
     return user_id

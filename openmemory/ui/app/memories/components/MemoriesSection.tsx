@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import { Category, Client } from "../../../components/types";
 import { MemoryTable } from "./MemoryTable";
@@ -8,15 +8,22 @@ import { PageSizeSelector } from "./PageSizeSelector";
 import { useMemoriesApi } from "@/hooks/useMemoriesApi";
 import { useRouter, useSearchParams } from "next/navigation";
 import { MemoryTableSkeleton } from "@/skeleton/MemoryTableSkeleton";
+import { RefreshCw, Activity } from "lucide-react";
+import { useToast } from "@/components/ui/use-toast";
 
 export function MemoriesSection() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { fetchMemories } = useMemoriesApi();
+  const { toast } = useToast();
   const [memories, setMemories] = useState<any[]>([]);
   const [totalItems, setTotalItems] = useState(0);
   const [totalPages, setTotalPages] = useState(1);
   const [isLoading, setIsLoading] = useState(true);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<Date>(new Date());
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
 
   const currentPage = Number(searchParams.get("page")) || 1;
   const itemsPerPage = Number(searchParams.get("size")) || 10;
@@ -25,27 +32,79 @@ export function MemoriesSection() {
   );
   const [selectedClient, setSelectedClient] = useState<Client | "all">("all");
 
-  useEffect(() => {
-    const loadMemories = async () => {
+  // 记忆数据加载函数
+  const loadMemories = useCallback(async (showRefreshing = false) => {
+    if (showRefreshing) {
+      setIsRefreshing(true);
+    } else {
       setIsLoading(true);
-      try {
-        const searchQuery = searchParams.get("search") || "";
-        const result = await fetchMemories(
-          searchQuery,
-          currentPage,
-          itemsPerPage
-        );
-        setMemories(result.memories);
-        setTotalItems(result.total);
-        setTotalPages(result.pages);
-      } catch (error) {
-        console.error("Failed to fetch memories:", error);
+    }
+    
+    try {
+      const searchQuery = searchParams.get("search") || "";
+      const result = await fetchMemories(
+        searchQuery,
+        currentPage,
+        itemsPerPage
+      );
+      setMemories(result.memories);
+      setTotalItems(result.total);
+      setTotalPages(result.pages);
+      setLastUpdated(new Date());
+      
+      if (showRefreshing) {
+        toast({
+          title: "数据已更新",
+          description: "记忆列表已刷新",
+        });
       }
+    } catch (error) {
+      console.error("Failed to fetch memories:", error);
+      toast({
+        title: "加载失败",
+        description: "无法获取记忆数据，请稍后重试",
+        variant: "destructive",
+      });
+    } finally {
       setIsLoading(false);
-    };
+      setIsRefreshing(false);
+    }
+  }, [searchParams, currentPage, itemsPerPage, fetchMemories, toast]);
 
+  // 手动刷新函数
+  const handleManualRefresh = useCallback(() => {
+    loadMemories(true);
+  }, [loadMemories]);
+
+  // 切换自动刷新
+  const toggleAutoRefresh = useCallback(() => {
+    setAutoRefresh(prev => !prev);
+  }, []);
+
+  // 自动刷新逻辑
+  useEffect(() => {
+    if (autoRefresh) {
+      intervalRef.current = setInterval(() => {
+        loadMemories(false);
+      }, 30000); // 30秒自动刷新一次
+    } else {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+        intervalRef.current = null;
+      }
+    }
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+    };
+  }, [autoRefresh, loadMemories]);
+
+  // 初始加载和参数变化时加载
+  useEffect(() => {
     loadMemories();
-  }, [currentPage, itemsPerPage, fetchMemories, searchParams]);
+  }, [currentPage, itemsPerPage, searchParams]);
 
   const setCurrentPage = (page: number) => {
     const params = new URLSearchParams(searchParams.toString());
@@ -76,6 +135,40 @@ export function MemoriesSection() {
 
   return (
     <div className="w-full bg-transparent">
+      {/* 刷新控制栏 */}
+      <div className="flex items-center justify-between mb-4 p-3 bg-zinc-900/50 rounded-lg border border-zinc-800">
+        <div className="flex items-center gap-3">
+          <div className="text-sm text-zinc-400">
+            最后更新: {lastUpdated.toLocaleTimeString('zh-CN')}
+          </div>
+          <div className="flex items-center gap-1">
+            <Activity className={`h-4 w-4 ${autoRefresh ? 'text-green-500' : 'text-zinc-500'}`} />
+            <span className="text-sm text-zinc-400">
+              {autoRefresh ? '自动刷新已启用' : '自动刷新已停用'}
+            </span>
+          </div>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={toggleAutoRefresh}
+          >
+            <Activity className={`h-4 w-4 mr-2 ${autoRefresh ? 'text-green-500' : 'text-zinc-500'}`} />
+            {autoRefresh ? '停用自动刷新' : '启用自动刷新'}
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleManualRefresh}
+            disabled={isLoading || isRefreshing}
+          >
+            <RefreshCw className={`h-4 w-4 mr-2 ${isRefreshing ? 'animate-spin' : ''}`} />
+            {isRefreshing ? '刷新中...' : '手动刷新'}
+          </Button>
+        </div>
+      </div>
+
       <div>
         {memories.length > 0 ? (
           <>

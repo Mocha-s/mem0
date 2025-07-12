@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import axios from 'axios';
+import { createApiUrl } from '@/utils/api';
 import { useDispatch, useSelector } from 'react-redux';
 import { AppDispatch, RootState } from '@/store/store';
 import { setApps, setTotalApps } from '@/store/profileSlice';
@@ -41,9 +42,8 @@ export const useStats = (): UseMemoriesApiReturn => {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await axios.get<APIStatsResponse>(
-        `${URL}/api/v1/stats?user_id=${user_id}`
-      );
+      const statsUrl = `${createApiUrl(URL, '/api/v1/stats/', { trailingSlash: true })}?user_id=${user_id}`;
+      const response = await axios.get<APIStatsResponse>(statsUrl);
       dispatch(setTotalMemories(response.data.total_memories));
       dispatch(setTotalApps(response.data.total_apps));
       dispatch(setApps(response.data.apps));

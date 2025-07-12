@@ -3,6 +3,9 @@
 # Base stage for common setup
 FROM node:18-alpine AS base
 
+# 更换为国内镜像源
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
 # Install dependencies for pnpm
 RUN apk add --no-cache libc6-compat curl && \
     corepack enable && \

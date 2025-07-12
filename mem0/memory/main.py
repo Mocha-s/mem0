@@ -9,7 +9,7 @@ import uuid
 import warnings
 from copy import deepcopy
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, List
 
 import pytz
 from pydantic import ValidationError
@@ -32,6 +32,12 @@ from mem0.memory.utils import (
     remove_code_blocks,
 )
 from mem0.utils.factory import EmbedderFactory, LlmFactory, VectorStoreFactory
+from mem0.utils.categories import (
+    extract_categories_from_custom_format,
+    auto_categorize_memory,
+    merge_categories,
+    validate_categories,
+)
 
 
 def _build_filters_and_metadata(
@@ -193,6 +199,7 @@ class Memory(MemoryBase):
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
+        custom_categories: Optional[List[Dict[str, str]]] = None,
     ):
         """
         Create a new memory.
@@ -215,6 +222,9 @@ class Memory(MemoryBase):
                 creating procedural memories (typically requires 'agent_id'). Otherwise, memories
                 are treated as general conversational/factual memories.memory_type (str, optional): Type of memory to create. Defaults to None. By default, it creates the short term memories and long term (semantic and episodic) memories. Pass "procedural_memory" to create procedural memories.
             prompt (str, optional): Prompt to use for the memory creation. Defaults to None.
+            custom_categories (List[Dict[str, str]], optional): Custom categories to use for memory classification.
+                Format: [{"category_name": "description"}, ...]. If provided, these will be used instead of
+                automatic categorization. Defaults to None.
 
 
         Returns:
@@ -230,6 +240,23 @@ class Memory(MemoryBase):
             run_id=run_id,
             input_metadata=metadata,
         )
+
+        # Process custom_categories if provided
+        if custom_categories:
+            # Extract category names from the custom_categories format
+            # Format: [{"category_name": "description"}, ...]
+            category_names = []
+            for category_dict in custom_categories:
+                if isinstance(category_dict, dict):
+                    # Get the first key as category name
+                    category_names.extend(category_dict.keys())
+                elif isinstance(category_dict, str):
+                    # Handle case where it's just a string
+                    category_names.append(category_dict)
+            
+            # Add categories to metadata
+            if category_names:
+                processed_metadata["categories"] = category_names
 
         if memory_type is not None and memory_type != MemoryType.PROCEDURAL.value:
             raise ValueError(
@@ -255,7 +282,7 @@ class Memory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
-            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer)
+            future1 = executor.submit(self._add_to_vector_store, messages, processed_metadata, effective_filters, infer, custom_categories)
             future2 = executor.submit(self._add_to_graph, messages, effective_filters)
 
             concurrent.futures.wait([future1, future2])
@@ -281,7 +308,31 @@ class Memory(MemoryBase):
 
         return {"results": vector_store_result}
 
-    def _add_to_vector_store(self, messages, metadata, filters, infer):
+    def _add_to_vector_store(self, messages, metadata, filters, infer, custom_categories=None):
+        # Process categories at the beginning
+        if custom_categories:
+            # Extract categories from custom format
+            custom_category_names = extract_categories_from_custom_format(custom_categories)
+            if custom_category_names:
+                metadata["categories"] = validate_categories(custom_category_names)
+        elif "categories" not in metadata:
+            # Auto-categorize if no categories provided
+            # Extract text content from messages for categorization
+            message_content = ""
+            if isinstance(messages, list):
+                for msg in messages:
+                    if isinstance(msg, dict) and "content" in msg:
+                        message_content += msg["content"] + " "
+            elif isinstance(messages, str):
+                message_content = messages
+            
+            if message_content and infer:
+                # Auto-categorize using LLM
+                auto_categories = auto_categorize_memory(message_content.strip(), self.llm)
+                metadata["categories"] = validate_categories(auto_categories)
+            else:
+                # Default category if no categorization
+                metadata["categories"] = ["misc"]
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -697,6 +748,7 @@ class Memory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "categories",  # Add categories to promoted keys
         ]
 
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
@@ -715,6 +767,10 @@ class Memory(MemoryBase):
             for key in promoted_payload_keys:
                 if key in mem.payload:
                     memory_item_dict[key] = mem.payload[key]
+
+            # Ensure categories is included in the result even if empty
+            if "categories" not in memory_item_dict:
+                memory_item_dict["categories"] = mem.payload.get("categories", [])
 
             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
             if additional_metadata:
@@ -1034,6 +1090,7 @@ class AsyncMemory(MemoryBase):
         infer: bool = True,
         memory_type: Optional[str] = None,
         prompt: Optional[str] = None,
+        custom_categories: Optional[List[Dict[str, str]]] = None,
         llm=None,
     ):
         """
@@ -1056,6 +1113,23 @@ class AsyncMemory(MemoryBase):
         processed_metadata, effective_filters = _build_filters_and_metadata(
             user_id=user_id, agent_id=agent_id, run_id=run_id, input_metadata=metadata
         )
+
+        # Process custom_categories if provided (same logic as sync version)
+        if custom_categories:
+            # Extract category names from the custom_categories format
+            # Format: [{"category_name": "description"}, ...]
+            category_names = []
+            for category_dict in custom_categories:
+                if isinstance(category_dict, dict):
+                    # Get the first key as category name
+                    category_names.extend(category_dict.keys())
+                elif isinstance(category_dict, str):
+                    # Handle case where it's just a string
+                    category_names.append(category_dict)
+            
+            # Add categories to metadata
+            if category_names:
+                processed_metadata["categories"] = category_names
 
         if memory_type is not None and memory_type != MemoryType.PROCEDURAL.value:
             raise ValueError(
@@ -1083,7 +1157,7 @@ class AsyncMemory(MemoryBase):
             messages = parse_vision_messages(messages)
 
         vector_store_task = asyncio.create_task(
-            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer)
+            self._add_to_vector_store(messages, processed_metadata, effective_filters, infer, custom_categories)
         )
         graph_task = asyncio.create_task(self._add_to_graph(messages, effective_filters))
 
@@ -1113,7 +1187,32 @@ class AsyncMemory(MemoryBase):
         metadata: dict,
         effective_filters: dict,
         infer: bool,
+        custom_categories=None,
     ):
+        # Process categories at the beginning (same logic as sync version)
+        if custom_categories:
+            # Extract categories from custom format
+            custom_category_names = extract_categories_from_custom_format(custom_categories)
+            if custom_category_names:
+                metadata["categories"] = validate_categories(custom_category_names)
+        elif "categories" not in metadata:
+            # Auto-categorize if no categories provided
+            # Extract text content from messages for categorization
+            message_content = ""
+            if isinstance(messages, list):
+                for msg in messages:
+                    if isinstance(msg, dict) and "content" in msg:
+                        message_content += msg["content"] + " "
+            elif isinstance(messages, str):
+                message_content = messages
+            
+            if message_content and infer:
+                # Auto-categorize using LLM
+                auto_categories = auto_categorize_memory(message_content.strip(), self.llm)
+                metadata["categories"] = validate_categories(auto_categories)
+            else:
+                # Default category if no categorization
+                metadata["categories"] = ["misc"]
         if not infer:
             returned_memories = []
             for message_dict in messages:
@@ -1544,6 +1643,7 @@ class AsyncMemory(MemoryBase):
             "run_id",
             "actor_id",
             "role",
+            "categories",  # Add categories to promoted keys
         ]
 
         core_and_promoted_keys = {"data", "hash", "created_at", "updated_at", "id", *promoted_payload_keys}
@@ -1562,6 +1662,10 @@ class AsyncMemory(MemoryBase):
             for key in promoted_payload_keys:
                 if key in mem.payload:
                     memory_item_dict[key] = mem.payload[key]
+
+            # Ensure categories is included in the result even if empty
+            if "categories" not in memory_item_dict:
+                memory_item_dict["categories"] = mem.payload.get("categories", [])
 
             additional_metadata = {k: v for k, v in mem.payload.items() if k not in core_and_promoted_keys}
             if additional_metadata:

@@ -147,6 +147,20 @@ export function FormView({ settings, onChange }: FormViewProps) {
               Custom instructions that will be used to guide memory processing and fact extraction.
             </p>
           </div>
+          
+          <div className="space-y-2">
+            <Label htmlFor="openapi-url">OpenAPI URL</Label>
+            <Input
+              id="openapi-url"
+              type="url"
+              placeholder="https://api.example.com/v1"
+              value={settings.openmemory?.openapi_url || ""}
+              onChange={(e) => handleOpenMemoryChange("openapi_url", e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground mt-1">
+              External OpenAPI service URL for API integration (optional).
+            </p>
+          </div>
         </CardContent>
       </Card>
 

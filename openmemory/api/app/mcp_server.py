@@ -25,6 +25,7 @@ from app.database import SessionLocal
 from app.models import Memory, MemoryAccessLog, MemoryState, MemoryStatusHistory
 from app.utils.db import get_user_and_app
 from app.utils.memory import get_memory_client
+from app.utils.client_configs import connection_monitor
 from app.utils.permissions import check_memory_access_permissions
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -67,6 +68,9 @@ async def add_memories(text: str) -> str:
         return "Error: user_id not provided"
     if not client_name:
         return "Error: client_name not provided"
+    
+    # Update connection activity
+    connection_monitor.update_activity(client_name, uid)
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
@@ -83,12 +87,35 @@ async def add_memories(text: str) -> str:
             if not app.is_active:
                 return f"Error: App {app.name} is currently paused on OpenMemory. Cannot create new memories."
 
-            response = memory_client.add(text,
-                                         user_id=uid,
-                                         metadata={
-                                            "source_app": "openmemory",
-                                            "mcp_client": client_name,
-                                        })
+            # Add timeout handling for memory client operations
+            import asyncio
+            from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+            
+            def add_memory_with_timeout():
+                return memory_client.add(text,
+                                       user_id=uid,
+                                       metadata={
+                                          "source_app": "openmemory",
+                                          "mcp_client": client_name,
+                                      })
+            
+            # Execute with timeout (30 seconds)
+            try:
+                with ThreadPoolExecutor() as executor:
+                    future = executor.submit(add_memory_with_timeout)
+                    response = future.result(timeout=30)
+            except FutureTimeoutError:
+                return json.dumps({
+                    "status": "error",
+                    "message": "Memory operation timed out. Please try again with shorter text or check your API configuration.",
+                    "error_code": "TIMEOUT"
+                }, indent=2)
+            except Exception as e:
+                return json.dumps({
+                    "status": "error", 
+                    "message": f"Memory operation failed: {str(e)}",
+                    "error_code": "API_ERROR"
+                }, indent=2)
 
             # Process the response and update database
             if isinstance(response, dict) and 'results' in response:
@@ -134,7 +161,22 @@ async def add_memories(text: str) -> str:
 
                 db.commit()
 
-            return response
+            # Return simplified response instead of full mem0 response
+            if isinstance(response, dict) and 'results' in response:
+                added_count = len([r for r in response['results'] if r['event'] == 'ADD'])
+                updated_count = len([r for r in response['results'] if r['event'] == 'UPDATE'])
+                deleted_count = len([r for r in response['results'] if r['event'] == 'DELETE'])
+                
+                simple_response = {
+                    "status": "success",
+                    "message": f"Memory operation completed",
+                    "added": added_count,
+                    "updated": updated_count,
+                    "deleted": deleted_count
+                }
+                return json.dumps(simple_response, indent=2)
+            else:
+                return json.dumps({"status": "success", "message": "Memory added successfully"}, indent=2)
         finally:
             db.close()
     except Exception as e:
@@ -150,6 +192,9 @@ async def search_memory(query: str) -> str:
         return "Error: user_id not provided"
     if not client_name:
         return "Error: client_name not provided"
+    
+    # Update connection activity
+    connection_monitor.update_activity(client_name, uid)
 
     # Get memory client safely
     memory_client = get_memory_client_safe()
@@ -162,82 +207,76 @@ async def search_memory(query: str) -> str:
             # Get or create user and app
             user, app = get_user_and_app(db, user_id=uid, app_id=client_name)
 
-            # Get accessible memory IDs based on ACL
-            user_memories = db.query(Memory).filter(Memory.user_id == user.id).all()
-            accessible_memory_ids = [memory.id for memory in user_memories if check_memory_access_permissions(db, memory, app.id)]
-            
-            conditions = [qdrant_models.FieldCondition(key="user_id", match=qdrant_models.MatchValue(value=uid))]
-            
-            if accessible_memory_ids:
-                # Convert UUIDs to strings for Qdrant
-                accessible_memory_ids_str = [str(memory_id) for memory_id in accessible_memory_ids]
-                conditions.append(qdrant_models.HasIdCondition(has_id=accessible_memory_ids_str))
+            # Use mem0's search method which is compatible with all vector stores
+            try:
+                search_results = memory_client.search(
+                    query=query,
+                    user_id=uid,
+                    limit=10
+                )
+                
+                # Process search results - handle both old and new response formats
+                if isinstance(search_results, dict) and 'results' in search_results:
+                    memories = search_results['results']
+                elif isinstance(search_results, list):
+                    memories = search_results
+                else:
+                    memories = []
+                
+                # Format memories consistently
+                formatted_memories = [
+                    {
+                        "id": memory.get("id"),
+                        "memory": memory.get("memory"),
+                        "score": memory.get("score", 0.0),
+                        "created_at": memory.get("created_at"),
+                        "updated_at": memory.get("updated_at"),
+                    }
+                    for memory in memories
+                ]
 
-            filters = qdrant_models.Filter(must=conditions)
-            embeddings = memory_client.embedding_model.embed(query, "search")
-            
-            hits = memory_client.vector_store.client.query_points(
-                collection_name=memory_client.vector_store.collection_name,
-                query=embeddings,
-                query_filter=filters,
-                limit=10,
-            )
+                # Log memory access for each memory found
+                for memory_data in memories:
+                    if memory_data.get('id'):
+                        try:
+                            memory_id = uuid.UUID(memory_data['id'])
+                            # Create access log entry
+                            access_log = MemoryAccessLog(
+                                memory_id=memory_id,
+                                app_id=app.id,
+                                access_type="search",
+                                metadata_={
+                                    "query": query,
+                                    "score": memory_data.get('score'),
+                                }
+                            )
+                            db.add(access_log)
+                        except (ValueError, TypeError) as e:
+                            logging.warning(f"Error creating access log for memory {memory_data.get('id')}: {e}")
 
-            # Process search results
-            memories = hits.points
-            memories = [
-                {
-                    "id": memory.id,
-                    "memory": memory.payload["data"],
-                    "hash": memory.payload.get("hash"),
-                    "created_at": memory.payload.get("created_at"),
-                    "updated_at": memory.payload.get("updated_at"),
-                    "score": memory.score,
-                }
-                for memory in memories
-            ]
-
-            # Log memory access for each memory found
-            if isinstance(memories, dict) and 'results' in memories:
-                print(f"Memories: {memories}")
-                for memory_data in memories['results']:
-                    if 'id' in memory_data:
-                        memory_id = uuid.UUID(memory_data['id'])
-                        # Create access log entry
-                        access_log = MemoryAccessLog(
-                            memory_id=memory_id,
-                            app_id=app.id,
-                            access_type="search",
-                            metadata_={
-                                "query": query,
-                                "score": memory_data.get('score'),
-                                "hash": memory_data.get('hash')
-                            }
-                        )
-                        db.add(access_log)
                 db.commit()
-            else:
-                for memory in memories:
-                    memory_id = uuid.UUID(memory['id'])
-                    # Create access log entry
-                    access_log = MemoryAccessLog(
-                        memory_id=memory_id,
-                        app_id=app.id,
-                        access_type="search",
-                        metadata_={
-                            "query": query,
-                            "score": memory.get('score'),
-                            "hash": memory.get('hash')
-                        }
-                    )
-                    db.add(access_log)
-                db.commit()
-            return json.dumps(memories, indent=2)
+
+                # Return formatted search results
+                if formatted_memories:
+                    result = f"Found {len(formatted_memories)} relevant memories:\n\n"
+                    for i, memory in enumerate(formatted_memories[:5], 1):  # Limit to top 5
+                        result += f"{i}. {memory['memory'][:200]}{'...' if len(memory['memory']) > 200 else ''}\n"
+                        if memory.get('score'):
+                            result += f"   Relevance: {memory['score']:.3f}\n"
+                        result += "\n"
+                    return result
+                else:
+                    return f"No memories found related to: {query}"
+            
+            except Exception as search_error:
+                logging.error(f"Error during memory search: {search_error}")
+                return f"Error searching memory: {search_error}"
+
         finally:
             db.close()
     except Exception as e:
-        logging.exception(e)
-        return f"Error searching memory: {e}"
+        logging.exception(f"Error searching memories: {e}")
+        return f"Error searching memories: {e}"
 
 
 @mcp.tool(description="List all memories in the user's memory")
@@ -382,6 +421,16 @@ async def handle_sse(request: Request):
     user_token = user_id_var.set(uid or "")
     client_name = request.path_params.get("client_name")
     client_token = client_name_var.set(client_name or "")
+    
+    # Register client connection
+    connection_monitor.register_connection(
+        client_name=client_name or "unknown",
+        user_id=uid or "default",
+        connection_info={
+            "user_agent": request.headers.get("user-agent", ""),
+            "remote_addr": request.client.host if request.client else "unknown"
+        }
+    )
 
     try:
         # Handle SSE connection
@@ -396,6 +445,8 @@ async def handle_sse(request: Request):
                 mcp._mcp_server.create_initialization_options(),
             )
     finally:
+        # Disconnect client
+        connection_monitor.disconnect_client(client_name or "unknown", uid or "default")
         # Clean up context variables
         user_id_var.reset(user_token)
         client_name_var.reset(client_token)
